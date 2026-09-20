@@ -16,6 +16,8 @@ from .schemas import (
     BatchList,
     BatchResult,
     BatchSummary,
+    ConflictFragilityMapOut,
+    ConflictFragilityRequest,
     ConflictRepairInfeasibleOut,
     ConflictRepairPlanOut,
     ConflictRepairRequest,
@@ -30,6 +32,7 @@ from .schemas import (
 )
 from .services import (
     ConflictRepairProtectedError,
+    build_batch_conflict_fragility_map,
     build_batch_threshold_map,
     compare_batches,
     plan_batch_augmentation,
@@ -308,6 +311,28 @@ def create_conflict_repair_plan(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return ConflictRepairPlanOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/conflict-fragility-map",
+    tags=["batches"],
+    summary="冲突图脆弱性分析：Tarjan low-link 一次遍历求割点与桥（只读）",
+    response_model=ConflictFragilityMapOut,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "风险等级非法"},
+    },
+)
+def create_conflict_fragility_map(
+    batch_id: str, payload: ConflictFragilityRequest
+) -> ConflictFragilityMapOut:
+    result = build_batch_conflict_fragility_map(
+        batch_id=batch_id,
+        risk_levels=payload.risk_levels,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return ConflictFragilityMapOut(**result)
 
 
 @app.post(

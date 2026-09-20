@@ -21,6 +21,11 @@ high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳�
 批次内引物，按所选风险等级构造**含自环的冲突图**，用**确定性分支限界**求
 覆盖全部冲突边的最小代价移除集（自环强制移除、受保护引物不可移除；保护约束
 令问题无解返回 409 并列出不可消除冲突；不修改批次）；
+通过 `POST /api/batches/{id}/conflict-fragility-map` 按所选风险等级从
+**已保存异二聚体**构造无向冲突图（平行重复边去重、自二聚体不参与连通性但
+作为固有自风险返回），用 **Tarjan low-link 一次遍历**识别全部**割点引物**
+（含删除后的连通分量数与各分裂组成员）与**桥配对**（含两侧成员），
+图可不连通（纯读，不重算对齐、不写库）；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
 对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
 
@@ -45,6 +50,7 @@ docker compose up --build -d
 | 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
+| 冲突图脆弱性分析 | `POST http://localhost:8000/api/batches/{id}/conflict-fragility-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
@@ -583,6 +589,99 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-repair-p
 * 批次不存在返回 `404`；引物位置越界/重复、受保护名称不属于批次或不在请求
   `primers` 范围内、引物数量超出 2～28、移除代价 < 1、风险等级非法返回 `422`。
 
+### `POST /api/batches/{id}/conflict-fragility-map` — 冲突图脆弱性分析（Tarjan 割点与桥，只读）
+
+对**已保存批次**按请求选择的风险等级（`high`/`medium`/`low`，可多选、自动去重）
+从**已落库异二聚体**构造无向冲突图，并用 **Tarjan low-link 一次遍历**识别全部
+**割点引物**与**桥配对**，评估冲突结构的脆弱点：
+
+* **冲突图**：批次全部引物为顶点（顶点号即批次位置；无冲突边的引物为孤立顶点，
+  仍计入连通分量数）。命中所选风险等级的**异二聚体**在两端引物间连一条无向边；
+  同一对引物的**平行重复边去重**为单边（不去重会被误判为非桥）；**自二聚体不
+  参与连通性**，命中等级的自二聚体作为 `intrinsic_self_risks` 单独返回；
+* **Tarjan low-link 一次遍历**：图可不连通——按批次位置升序对每个未访问分量做
+  迭代式 DFS（邻点按位置升序访问），同一遍遍历得到发现时间 `tin`、回溯可达最早
+  发现时间 `low` 与欧拉区间。非根顶点 v 是割点 ⟺ 存在 DFS 子节点 u 使
+  `low[u] ≥ tin[v]`；DFS 根是割点 ⟺ 有 ≥ 2 个子节点；树边 (v, u) 是桥 ⟺
+  `low[u] > tin[v]`。分裂组与桥两侧由 DFS 子树的欧拉区间直接切片得到，
+  总复杂度 O(引物数 + 冲突边数)；
+* **割点输出**：每个割点给出 `components_after_removal`（从整张冲突图删除该
+  顶点后的连通分量数，其余分量不受影响）与 `split_groups`（其所在分量分裂出的
+  各组成员）；**桥输出**：每座桥给出 `side_a` / `side_b` 两侧成员；
+* **确定性排序**：成员列表、割点、桥均按批次位置升序（同一割点的分裂组按组内
+  最小位置、桥按两端位置升序），相同输入结果稳定可复现；
+* **只读**：纯读操作，只使用已保存配对，**不重算对齐、不写库**；
+  批次不存在返回 `404`，风险等级非法返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-fragility-map \
+  -H 'Content-Type: application/json' \
+  -d '{"risk_levels": ["high", "medium"]}'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `risk_levels` | 构成冲突边的异二聚体风险等级，取值 `high`/`medium`/`low`（大小写、首尾空白自动规范化），至少 1 个；重复值去重 |
+
+返回示例（8 引物批次：路径 P0–P1–P2–P3 接三角形 P3–P4–P5，P6 自二聚体 high，
+P7 无冲突；选 `high`）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "risk_levels": ["high"],
+  "primer_count": 8,
+  "conflict_edge_count": 6,
+  "component_count": 3,
+  "articulation_point_count": 3,
+  "bridge_count": 3,
+  "articulation_points": [
+    {
+      "position": 1, "name": "P1",
+      "components_after_removal": 4,
+      "split_groups": [
+        [{"position": 0, "name": "P0"}],
+        [
+          {"position": 2, "name": "P2"},
+          {"position": 3, "name": "P3"},
+          {"position": 4, "name": "P4"},
+          {"position": 5, "name": "P5"}
+        ]
+      ]
+    }
+  ],
+  "bridges": [
+    {
+      "position_a": 0, "name_a": "P0",
+      "position_b": 1, "name_b": "P1",
+      "risk_level": "high",
+      "side_a": [{"position": 0, "name": "P0"}],
+      "side_b": [
+        {"position": 1, "name": "P1"},
+        {"position": 2, "name": "P2"},
+        {"position": 3, "name": "P3"},
+        {"position": 4, "name": "P4"},
+        {"position": 5, "name": "P5"}
+      ]
+    }
+  ],
+  "intrinsic_self_risks": [
+    {"position": 6, "name": "P6", "risk_level": "high"}
+  ]
+}
+```
+
+* `component_count` 为删除任何顶点**之前**的连通分量数（孤立引物各算一个）；
+  割点的 `components_after_removal` 恒等于 `component_count - 1 + 分裂组数`；
+* `split_groups` 各组成员之和恰好是割点所在分量去掉割点本身；桥两侧成员之和
+  恰好是桥所在分量的全部引物；
+* 三角形/环上的边不是桥、环上无外向边的顶点不是割点（上例中 P3–P4、P3–P5、
+  P4–P5 不在 `bridges` 中，P4、P5 不在 `articulation_points` 中）；
+* 未命中任何配对时图为空：`conflict_edge_count` 为 0、`component_count` 等于
+  `primer_count`、割点与桥均为空列表。
+
 ### `GET /api/batches/{base_id}/compare/{target_id}` — 批次风险对比
 
 按引物**名称**构造稳定配对键，对比 base → target 两个已保存批次的配对风险：
@@ -743,12 +842,13 @@ app/
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
   augmentation.py # 候选增量冲突图上的确定性分支限界（容量受限最大独立集）
   repair.py     # 批次内含自环冲突图上的确定性分支限界（最小代价顶点覆盖/移除集）
+  fragility.py  # 异二聚体冲突图的 Tarjan low-link 一次遍历（割点分裂组与桥两侧成员）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、阈值地图与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、冲突修复、冲突图脆弱性分析、阈值地图与对比编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试
