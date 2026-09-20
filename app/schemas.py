@@ -566,3 +566,101 @@ class ConflictRepairInfeasibleOut(BaseModel):
     unresolvable_conflicts: list[UnresolvableConflictOut] = Field(
         description="保护约束下无法被任何移除集覆盖的冲突（按两端批次位置升序）"
     )
+
+
+class ConflictFragilityMapRequest(BaseModel):
+    risk_levels: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "构成冲突边的异二聚体风险等级（仅 high/medium/low）；达到这些等级的"
+            "异二聚体两两构成冲突图边，自二聚体不参与连通性、单独汇总返回。"
+            "重复值自动去重"
+        ),
+    )
+
+    @field_validator("risk_levels")
+    @classmethod
+    def _risk_levels(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for value in values:
+            level = value.strip().lower()
+            if level not in _RISK_LEVELS:
+                bad.append(value)
+            elif level not in normalized:
+                normalized.append(level)
+        if bad:
+            raise ValueError(
+                "风险等级仅支持 high/medium/low，非法值: "
+                + ", ".join(repr(v) for v in bad)
+            )
+        return normalized
+
+
+class ConflictFragilityMemberOut(BaseModel):
+    position: int = Field(description="引物在批次中的位置（0 起）")
+    name: str
+
+
+class ConflictFragilitySplitGroupOut(BaseModel):
+    members: list[ConflictFragilityMemberOut] = Field(
+        description="分裂组成员（按批次位置升序）"
+    )
+
+
+class ConflictFragilityArticulationPointOut(BaseModel):
+    position: int = Field(description="割点引物在批次中的位置（0 起）")
+    name: str
+    component_count_after_removal: int = Field(
+        description="从全图移除该割点后的连通分量总数（含未受影响的其他分量）"
+    )
+    split_group_count: int = Field(
+        description="该割点所在连通分量在移除后分裂出的组数（≥2）"
+    )
+    split_groups: list[ConflictFragilitySplitGroupOut] = Field(
+        description="各分裂组成员（组内按批次位置升序，组间按组内最小位置升序）"
+    )
+
+
+class ConflictFragilityBridgeOut(BaseModel):
+    position_a: int = Field(description="桥一端在批次中的位置（较小者）")
+    name_a: str
+    position_b: int = Field(description="桥另一端在批次中的位置（较大者）")
+    name_b: str
+    risk_level: str = Field(description="该桥对应异二聚体配对的风险等级")
+    side_a: list[ConflictFragilityMemberOut] = Field(
+        description="移除该桥后含 position_a 一侧的成员（按批次位置升序）"
+    )
+    side_b: list[ConflictFragilityMemberOut] = Field(
+        description="移除该桥后含 position_b 一侧的成员（按批次位置升序）"
+    )
+
+
+class ConflictFragilitySelfRiskOut(BaseModel):
+    position: int = Field(description="引物在批次中的位置（0 起）")
+    name: str
+    risk_level: str = Field(description="该引物自二聚体命中的风险等级")
+
+
+class ConflictFragilityMapOut(BaseModel):
+    batch_id: str
+    risk_levels: list[str]
+    primer_count: int = Field(description="批次引物数（冲突图顶点数）")
+    conflict_edge_count: int = Field(
+        description="命中风险等级的异二聚体冲突边数（平行重复边已去重）"
+    )
+    component_count: int = Field(
+        description="冲突图连通分量数（无冲突边的孤立引物各计为一个分量）"
+    )
+    articulation_point_count: int
+    bridge_count: int
+    articulation_points: list[ConflictFragilityArticulationPointOut] = Field(
+        description="全部割点引物（按批次位置升序）"
+    )
+    bridges: list[ConflictFragilityBridgeOut] = Field(
+        description="全部桥配对（按两端批次位置升序）"
+    )
+    intrinsic_self_risks: list[ConflictFragilitySelfRiskOut] = Field(
+        description="命中风险等级的自二聚体（不参与连通性，按批次位置升序）"
+    )

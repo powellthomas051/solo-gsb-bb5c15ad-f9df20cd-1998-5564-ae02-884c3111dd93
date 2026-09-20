@@ -21,6 +21,11 @@ high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳�
 批次内引物，按所选风险等级构造**含自环的冲突图**，用**确定性分支限界**求
 覆盖全部冲突边的最小代价移除集（自环强制移除、受保护引物不可移除；保护约束
 令问题无解返回 409 并列出不可消除冲突；不修改批次）；
+通过 `POST /api/batches/{id}/conflict-fragility-map` 按所选风险等级从已保存
+异二聚体构造**无向冲突图**（平行重复边去重、图可不连通），用 **Tarjan
+low-link 一次遍历**识别全部割点引物（含移除后的连通分量数与各分裂组成员）
+与桥配对（含两侧成员），命中等级的自二聚体不参与连通性、作为
+`intrinsic_self_risks` 单独返回（不重算对齐、不写库）；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
 对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
 
@@ -45,6 +50,7 @@ docker compose up --build -d
 | 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 冲突修复计划 | `POST http://localhost:8000/api/batches/{id}/conflict-repair-plan` |
+| 冲突图割点与桥 | `POST http://localhost:8000/api/batches/{id}/conflict-fragility-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
@@ -582,6 +588,91 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-repair-p
 
 * 批次不存在返回 `404`；引物位置越界/重复、受保护名称不属于批次或不在请求
   `primers` 范围内、引物数量超出 2～28、移除代价 < 1、风险等级非法返回 `422`。
+
+### `POST /api/batches/{id}/conflict-fragility-map` — 冲突图割点与桥（Tarjan low-link，不重算对齐）
+
+对**已保存批次**按请求选择的风险等级（`high`/`medium`/`low`，可多选、自动去重）
+从**已落库异二聚体**构造无向冲突图，并用 **Tarjan low-link 一次遍历**识别图的
+全部脆弱点：
+
+* **冲突图**：批次内全部引物为顶点（顶点号即批次位置）；命中所选风险等级的
+  **异二聚体**在两端引物间连一条无向边，**平行重复边去重**；图**可不连通**，
+  无冲突边的孤立引物各计为一个连通分量；
+* **割点引物**：移除后全图连通分量数增加的引物。每个割点给出
+  `component_count_after_removal`（移除后的全图连通分量总数，含未受影响的
+  其他分量）与 `split_groups`（其所在连通分量分裂出的各组成员）；
+* **桥配对**：移除后连通分量数增加的冲突边。每座桥给出两侧成员
+  （`side_a` 为含 `position_a` 的一侧）；
+* **自二聚体不参与连通性**：命中所选等级的自二聚体不构成边/自环，而是作为
+  `intrinsic_self_risks` 单独返回（固有自身风险）；
+* **确定性排序**：割点按批次位置升序；分裂组内成员按位置升序、组间按组内
+  最小位置升序；桥按两端位置 `(position_a, position_b)` 升序（`position_a`
+  较小），两侧成员各自按位置升序；相同输入结果稳定可复现；
+* **只读**：仅使用已保存配对结果，**不重算对齐、不写库**；
+  批次不存在返回 `404`，风险等级非法返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../conflict-fragility-map \
+  -H 'Content-Type: application/json' \
+  -d '{"risk_levels": ["high", "medium"]}'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `risk_levels` | 构成冲突边的异二聚体风险等级，取值 `high`/`medium`/`low`（大小写、首尾空白自动规范化），至少 1 个；重复值去重 |
+
+返回示例（星型冲突图：CEN 为中心，S1/S2/S3 各与 CEN 一条 high 边）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "risk_levels": ["high", "medium"],
+  "primer_count": 12,
+  "conflict_edge_count": 8,
+  "component_count": 5,
+  "articulation_point_count": 1,
+  "bridge_count": 4,
+  "articulation_points": [
+    {
+      "position": 3,
+      "name": "CEN",
+      "component_count_after_removal": 7,
+      "split_group_count": 3,
+      "split_groups": [
+        {"members": [{"position": 0, "name": "S1"}]},
+        {"members": [{"position": 1, "name": "S2"}]},
+        {"members": [{"position": 2, "name": "S3"}]}
+      ]
+    }
+  ],
+  "bridges": [
+    {
+      "position_a": 0, "name_a": "S1",
+      "position_b": 3, "name_b": "CEN",
+      "risk_level": "high",
+      "side_a": [{"position": 0, "name": "S1"}],
+      "side_b": [
+        {"position": 1, "name": "S2"},
+        {"position": 2, "name": "S3"},
+        {"position": 3, "name": "CEN"}
+      ]
+    }
+  ],
+  "intrinsic_self_risks": [
+    {"position": 8, "name": "H", "risk_level": "high"}
+  ]
+}
+```
+
+* `articulation_point_count` / `bridge_count` 恒等于 `articulation_points` /
+  `bridges` 的长度；`split_group_count` 恒等于该割点 `split_groups` 的长度（≥2）；
+* 移除割点只影响其所在连通分量：`component_count_after_removal =
+  component_count - 1 + split_group_count`；
+* 桥两侧 `side_a` 与 `side_b` 的并集即桥所在连通分量的全部成员，两者不相交；
+* 两点分量（仅一条边的分量）的边必为桥，但其端点不是割点（移除一端后另一端
+  自成分量，分量数不变）。
 
 ### `GET /api/batches/{base_id}/compare/{target_id}` — 批次风险对比
 

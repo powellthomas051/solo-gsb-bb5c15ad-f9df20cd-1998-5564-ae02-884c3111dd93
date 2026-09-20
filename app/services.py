@@ -9,6 +9,7 @@ from . import db
 from .augmentation import maximum_independent_set
 from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
+from .fragility import find_fragility
 from .pooling import build_pool_plan
 from .ranking import non_dominated_layers
 from .repair import InfeasibleRepair, minimum_cost_removal
@@ -760,6 +761,108 @@ def plan_batch_conflict_repair(
         "removed": removed_out,
         "retained": retained_out,
         "covered_conflicts": covered,
+    }
+
+
+def build_batch_conflict_fragility_map(
+    *,
+    batch_id: str,
+    risk_levels: list[str],
+) -> dict | None:
+    """已保存批次的冲突图脆弱性分析（纯读，不重算对齐、不写库）。
+
+    仅使用已落库的配对结果构造无向冲突图：批次内全部引物为顶点（顶点号即
+    批次位置），命中所选风险等级的异二聚体在两端间连一条边（平行重复边
+    去重）；自二聚体不参与连通性，命中等级的自二聚体单独汇总为
+    intrinsic_self_risks。图上用 Tarjan low-link 一次遍历识别全部割点
+    （含移除后的连通分量数与各分裂组成员）与桥（含两侧成员）；图可不连通，
+    孤立顶点计为大小为 1 的连通分量。批次不存在返回 None（由路由层转 404）。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    n = len(primers)
+    # 批次内引物名称唯一（入库时已保证）
+    position_by_name = {row["name"]: row["position"] for row in primers}
+    name_by_position = {pos: name for name, pos in position_by_name.items()}
+
+    levels = set(risk_levels)
+    edges: list[tuple[int, int]] = []
+    edge_risk: dict[tuple[int, int], str] = {}
+    self_risks: list[dict] = []
+    for row in pairs:
+        if row["risk_level"] not in levels:
+            continue
+        if row["is_self_dimer"]:
+            # 自二聚体行的 top/bottom 同名；不参与连通性，记固有自身风险
+            position = position_by_name[row["name_top"]]
+            self_risks.append(
+                {
+                    "position": position,
+                    "name": row["name_top"],
+                    "risk_level": row["risk_level"],
+                }
+            )
+            continue
+        pos_a = position_by_name[row["name_top"]]
+        pos_b = position_by_name[row["name_bottom"]]
+        edge = (pos_a, pos_b) if pos_a < pos_b else (pos_b, pos_a)
+        if edge in edge_risk:
+            continue  # 平行重复边去重（保留先出现者）
+        edge_risk[edge] = row["risk_level"]
+        edges.append(edge)
+
+    fragility = find_fragility(n, edges)
+
+    def _member(position: int) -> dict:
+        return {"position": position, "name": name_by_position[position]}
+
+    articulation_points_out = [
+        {
+            "position": ap.vertex,
+            "name": name_by_position[ap.vertex],
+            "component_count_after_removal": (
+                fragility.component_count - 1 + len(ap.split_groups)
+            ),
+            "split_group_count": len(ap.split_groups),
+            "split_groups": [
+                {"members": [_member(pos) for pos in group]}
+                for group in ap.split_groups
+            ],
+        }
+        for ap in fragility.articulation_points
+    ]
+
+    bridges_out = [
+        {
+            "position_a": br.a,
+            "name_a": name_by_position[br.a],
+            "position_b": br.b,
+            "name_b": name_by_position[br.b],
+            "risk_level": edge_risk[(br.a, br.b)],
+            "side_a": [_member(pos) for pos in br.side_a],
+            "side_b": [_member(pos) for pos in br.side_b],
+        }
+        for br in fragility.bridges
+    ]
+
+    self_risks.sort(key=lambda item: item["position"])
+
+    return {
+        "batch_id": batch_id,
+        "risk_levels": risk_levels,
+        "primer_count": n,
+        "conflict_edge_count": len(edges),
+        "component_count": fragility.component_count,
+        "articulation_point_count": len(articulation_points_out),
+        "bridge_count": len(bridges_out),
+        "articulation_points": articulation_points_out,
+        "bridges": bridges_out,
+        "intrinsic_self_risks": self_risks,
     }
 
 
